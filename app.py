@@ -1,6 +1,6 @@
 """Opportunity Navigator backend (Flask + SQLAlchemy).
 Local: SQLite file. Online: set DATABASE_URL to a hosted Postgres URL."""
-import os, re, secrets, hashlib, smtplib, threading, datetime as dt
+import os, re, json, urllib.request, urllib.error, secrets, hashlib, smtplib, threading, datetime as dt
 from email.message import EmailMessage
 from functools import wraps
 
@@ -144,8 +144,21 @@ def login_required(*roles):
 
 
 def send_email(to, subject, body):
+    """Sends through Brevo's web API (works on Render's free plan). Falls back to SMTP, then to printing."""
+    key = os.environ.get('BREVO_API_KEY')
+    if key:
+        sender = os.environ.get('EMAIL_FROM') or os.environ.get('SMTP_FROM', '')
+        payload = json.dumps({'sender': {'name': os.environ.get('EMAIL_FROM_NAME', 'Opportunity Navigator'), 'email': sender},
+                              'to': [{'email': to}], 'subject': subject, 'textContent': body}).encode()
+        req = urllib.request.Request('https://api.brevo.com/v3/smtp/email', data=payload, method='POST',
+                                     headers={'api-key': key, 'content-type': 'application/json', 'accept': 'application/json'})
+        try:
+            urllib.request.urlopen(req, timeout=20).read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f'Brevo said {e.code}: {e.read().decode()[:300]}')
+        return
     host = os.environ.get('SMTP_HOST')
-    if not host:   # no mail server configured yet: print the email so you can test locally
+    if not host:   # nothing configured: print the email so you can test
         print(f'\n--- EMAIL to {to}: {subject}\n{body}\n---\n')
         return
     msg = EmailMessage()
@@ -571,8 +584,8 @@ def bootstrap_first_admin():
 
 
 with app.app_context():
-   db.create_all()
-   bootstrap_first_admin()
+    db.create_all()
+    bootstrap_first_admin()
 
 if __name__ == '__main__':
     app.run(debug=True)
