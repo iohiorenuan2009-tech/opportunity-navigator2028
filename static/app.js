@@ -23,6 +23,9 @@ const daysLeft = iso => Math.round((Date.parse(iso) - Date.now()) / 864e5);
 const statusTag = o => { const d = daysLeft(o.deadline); return d < 0 ? ['closed', 'Closed'] : d <= 14 ? ['soon', 'Closing soon'] : ['open', 'Open']; };
 const canEdit = o => PUBLISH.includes(me.role) || (o.created_by === me.id && ['pending', 'rejected'].includes(o.status));
 
+const head = (title, sub = '', right = '') => `<div class="page-head"><div class="inner"><div><h1>${title}</h1>${sub ? `<p>${sub}</p>` : ''}</div>${right ? `<div class="head-actions">${right}</div>` : ''}</div></div>`;
+const savedSet = new Set();
+
 function renderNav() {
   const n = $('#nav');
   if (!me) { n.hidden = true; return; }
@@ -30,9 +33,13 @@ function renderNav() {
   if (me.role === 'student') links.push(['wishlist', 'Wishlist']);
   if (ADD.includes(me.role)) links.push(['manage', me.role === 'teacher' ? 'My submissions' : 'Review'], ['form', 'Add opportunity']);
   if (me.role === 'admin') links.push(['members', 'Members']);
+  let cur = location.hash.replace(/^#\/?/, '').split(/[/?]/)[0] || 'discover';
+  if (cur === 'detail') cur = 'discover';
+  const initials = me.name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
   n.hidden = false;
-  n.innerHTML = links.map(([p, l]) => `<a href="#/${p}">${l}</a>`).join('')
-    + `<span class="who">${esc(me.name)} · ${esc(ROLE_LABEL[me.role] || me.role)}</span><button class="btn sm alt" id="logout">Log out</button>`;
+  n.innerHTML = links.map(([p, l]) => `<a href="#/${p}" class="${p === cur ? 'on' : ''}">${l}</a>`).join('')
+    + `<span class="who"><span class="avatar">${esc(initials)}</span><div><b>${esc(me.name)}</b><small>${esc(ROLE_LABEL[me.role] || me.role)}</small></div></span>`
+    + `<button class="btn sm alt" id="logout">Log out</button>`;
   $('#logout').onclick = logout;
 }
 
@@ -62,7 +69,7 @@ window.addEventListener('hashchange', route);
 
 /* ---------- LOGIN: password, then code or link from email ---------- */
 function renderLogin() {
-  view(`<div class="auth-page"><div class="auth-card">
+  view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
     <h1>Welcome back</h1>
     <p class="sub">Accounts are set up by the school. Log in with your school email.</p>
     <div class="form-group"><label for="l-email">Email</label><input id="l-email" type="email" autocomplete="email"></div>
@@ -88,13 +95,13 @@ async function renderVerify(params) {
       me = (await api('/api/verify', 'POST', { token })).user;
       location.hash = '#/discover';
     } catch (e) {
-      view(`<div class="auth-page"><div class="auth-card"><h1>Link not valid</h1>
+      view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span><h1>Link not valid</h1>
         <p class="sub">${esc(e.message)}</p><a class="btn block" href="#/login">Back to log in</a></div></div>`);
     }
     return;
   }
   if (!pendingEmail) { location.hash = '#/login'; return; }
-  view(`<div class="auth-page"><div class="auth-card">
+  view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
     <h1>Check your email</h1>
     <p class="sub">We sent a 6-digit code and a sign-in link to ${esc(pendingEmail)}. Both expire in 10 minutes.</p>
     <div class="form-group"><label for="v-code">Code</label><input id="v-code" inputmode="numeric" maxlength="6" autocomplete="one-time-code"></div>
@@ -117,24 +124,26 @@ async function logout() {
 
 /* ---------- SHARED CARDS AND SAVE BUTTONS ---------- */
 function oppCard(o, saved) {
-  const [cls, txt] = statusTag(o);
-  return `<div class="card"><div class="card-main">
-    <div class="tags"><span class="tag">${esc(o.type)}</span><span class="tag" data-field="${esc(o.field)}">${esc(o.field)}</span>
-      <span class="status ${cls}">${txt}</span></div>
+  const d = daysLeft(o.deadline), [cls] = statusTag(o);
+  const due = d < 0 ? 'Closed' : d === 0 ? 'Closes today' : d === 1 ? '1 day left' : `${d} days left`;
+  return `<article class="card" data-field="${esc(o.field)}">
+    <div class="card-top"><span class="tag">${esc(o.field)}</span><span class="due ${cls}">${due}</span></div>
     <h3><a href="#/detail/${o.id}">${esc(o.title)}</a></h3>
-    <p class="muted-text">${esc(o.provider)} · ${esc(o.location)}</p>
-    <div class="meta"><span>Deadline: ${esc(o.deadline)}</span><span>Aid: ${esc(o.aid)}</span><span>Ages ${o.age_min}–${o.age_max}</span></div>
-  </div>${me.role === 'student' ? `<div class="card-side">
-    <button class="heart ${saved ? 'on' : ''}" data-save="${o.id}">${saved ? '♥ Saved' : '♡ Save'}</button></div>` : ''}</div>`;
+    <p class="provider">${esc(o.provider)} · ${esc(o.location)}</p>
+    <ul class="facts-inline"><li>${esc(o.type)}</li><li>Aid: ${esc(o.aid)}</li><li>Ages ${o.age_min}–${o.age_max}</li><li>${o.duration_weeks} weeks</li></ul>
+    <div class="card-foot"><span class="deadline">Deadline ${esc(o.deadline)}</span>${me.role === 'student'
+      ? `<button class="heart ${saved ? 'on' : ''}" data-save="${o.id}">${saved ? '♥ Saved' : '♡ Save'}</button>`
+      : `<a class="btn alt sm" href="#/detail/${o.id}">View</a>`}</div></article>`;
 }
 
 function wireSave() {
   document.querySelectorAll('[data-save]').forEach(b => b.onclick = async () => {
-    const on = b.classList.contains('on');
+    const on = b.classList.contains('on'), id = +b.dataset.save;
     try {
-      await api('/api/saved/' + b.dataset.save, on ? 'DELETE' : 'PUT');
+      await api('/api/saved/' + id, on ? 'DELETE' : 'PUT');
+      on ? savedSet.delete(id) : savedSet.add(id);
       b.classList.toggle('on', !on);
-      b.textContent = on ? '♡ Save' : '♥ Saved';
+      b.textContent = b.classList.contains('heart') ? (on ? '♡ Save' : '♥ Saved') : (on ? '♡ Save to wishlist' : '♥ Saved');
     } catch (e) { flash(e.message, true); }
   });
 }
@@ -145,53 +154,68 @@ async function act(fn, msg) {
 
 /* ---------- DISCOVER (everyone) ---------- */
 async function renderDiscover() {
-  const [opps, saved] = await Promise.all([api('/api/opportunities'),
-    me.role === 'student' ? api('/api/saved') : []]);
-  const savedIds = new Set(saved.map(o => o.id));
-  const list = opps.filter(o =>
-    (!filters.q || (o.title + o.provider + o.description + o.field).toLowerCase().includes(filters.q.toLowerCase())) &&
-    (!filters.field || o.field === filters.field) && (!filters.type || o.type === filters.type) &&
-    (!filters.aid || o.aid === filters.aid) && (!filters.hideClosed || daysLeft(o.deadline) >= 0));
-  const opt = (arr, cur) => '<option value="">All</option>' +
-    arr.map(v => `<option ${v === cur ? 'selected' : ''}>${esc(v)}</option>`).join('');
-  view(`<div class="wrap">
-    <div class="hero"><h1>Hi ${esc(me.first_name)}, this opportunity is about to find you.</h1>
-      <p>Programmes, scholarships, competitions and conferences for ALA members.</p></div>
-    <div class="page-grid"><aside class="filters">
-      <h2>Filter by</h2>
-      <input id="f-q" type="search" placeholder="Search" value="${esc(filters.q)}">
-      <label class="fld" for="f-field">Field</label><select id="f-field">${opt(meta.fields, filters.field)}</select>
-      <label class="fld" for="f-type">Type</label><select id="f-type">${opt(meta.types, filters.type)}</select>
-      <label class="fld" for="f-aid">Financial aid</label><select id="f-aid">${opt(meta.aids, filters.aid)}</select>
-      <label class="chk"><input type="checkbox" id="f-closed" ${filters.hideClosed ? 'checked' : ''}> Hide closed</label>
-    </aside>
-    <section><p class="count">${list.length} found</p>
-      ${list.map(o => oppCard(o, savedIds.has(o.id))).join('') || '<div class="empty">No opportunities match.</div>'}
-    </section></div></div>`);
-  $('#f-q').onchange = e => { filters.q = e.target.value; renderDiscover(); };
-  $('#f-field').onchange = e => { filters.field = e.target.value; renderDiscover(); };
-  $('#f-type').onchange = e => { filters.type = e.target.value; renderDiscover(); };
-  $('#f-aid').onchange = e => { filters.aid = e.target.value; renderDiscover(); };
-  $('#f-closed').onchange = e => { filters.hideClosed = e.target.checked; renderDiscover(); };
-  wireSave();
+  const [opps, saved] = await Promise.all([api('/api/opportunities'), me.role === 'student' ? api('/api/saved') : []]);
+  savedSet.clear(); saved.forEach(o => savedSet.add(o.id));
+  const opt = (arr, cur) => '<option value="">All</option>' + arr.map(v => `<option ${v === cur ? 'selected' : ''}>${esc(v)}</option>`).join('');
+  view(`<div class="hero"><div class="inner">
+      <h1>Hi ${esc(me.first_name)}, what would you like to do next?</h1>
+      <p>Scholarships, programmes, competitions and conferences collected for ALA.</p>
+      <label class="sr" for="f-q">Search opportunities</label>
+      <div class="search"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="f-q" type="search" autocomplete="off" placeholder="Search by name, provider or field" value="${esc(filters.q)}"></div>
+      <div class="chips" id="chips">${['', ...meta.fields].map(f =>
+        `<button class="chip ${filters.field === f ? 'on' : ''}" data-field="${esc(f)}" data-f="${esc(f)}">${f ? esc(f) : 'All fields'}</button>`).join('')}</div>
+    </div></div>
+    <div class="wrap"><div class="toolbar"><p class="count" id="count"></p>
+      <div class="selects">
+        <label class="sel">Type <select id="f-type">${opt(meta.types, filters.type)}</select></label>
+        <label class="sel">Financial aid <select id="f-aid">${opt(meta.aids, filters.aid)}</select></label>
+        <label class="chk"><input type="checkbox" id="f-closed" ${filters.hideClosed ? 'checked' : ''}> Hide closed</label>
+      </div></div>
+      <section class="grid" id="results"></section></div>`);
+
+  const paint = () => {
+    const q = filters.q.trim().toLowerCase();
+    const list = opps.filter(o =>
+      (!q || (o.title + ' ' + o.provider + ' ' + o.description + ' ' + o.field + ' ' + o.location).toLowerCase().includes(q)) &&
+      (!filters.field || o.field === filters.field) && (!filters.type || o.type === filters.type) &&
+      (!filters.aid || o.aid === filters.aid) && (!filters.hideClosed || daysLeft(o.deadline) >= 0));
+    $('#count').textContent = `${list.length} ${list.length === 1 ? 'opportunity' : 'opportunities'}`;
+    $('#results').innerHTML = list.map(o => oppCard(o, savedSet.has(o.id))).join('')
+      || '<div class="empty">Nothing matches your search.<br><button class="btn alt" id="clear">Clear search and filters</button></div>';
+    const c = $('#clear');
+    if (c) c.onclick = () => { Object.assign(filters, { q: '', field: '', type: '', aid: '', hideClosed: true }); renderDiscover(); };
+    wireSave();
+  };
+  $('#f-q').oninput = e => { filters.q = e.target.value; paint(); };
+  document.querySelectorAll('#chips .chip').forEach(b => b.onclick = () => {
+    filters.field = b.dataset.f;
+    document.querySelectorAll('#chips .chip').forEach(x => x.classList.toggle('on', x === b));
+    paint();
+  });
+  $('#f-type').onchange = e => { filters.type = e.target.value; paint(); };
+  $('#f-aid').onchange = e => { filters.aid = e.target.value; paint(); };
+  $('#f-closed').onchange = e => { filters.hideClosed = e.target.checked; paint(); };
+  paint();
 }
 
 async function renderDetail(id) {
   const o = await api('/api/opportunities/' + id);
-  const [cls, txt] = statusTag(o);
+  const d = daysLeft(o.deadline), [cls] = statusTag(o);
+  const due = d < 0 ? 'Closed' : d === 0 ? 'Closes today' : d === 1 ? '1 day left' : `${d} days left`;
   const saved = me.role === 'student' && (await api('/api/saved')).some(s => s.id === o.id);
   const rows = [['Field', o.field], ['Type', o.type], ['Financial aid', o.aid], ['Deadline', o.deadline],
     ['Ages', `${o.age_min} to ${o.age_max}`], ['Duration', `${o.duration_weeks} weeks`],
-    ['Location', o.location], ['Eligibility', o.eligibility], ['Status', o.status]];
-  view(`<div class="wrap"><a class="back-link" href="#/discover">← Back</a>
-    <h1 class="page-title">${esc(o.title)}</h1>
-    <p class="muted-text">Offered by ${esc(o.provider)} · <span class="status ${cls}">${txt}</span></p>
-    <div class="panel"><h2>Description</h2><p class="pre">${esc(o.description)}</p></div>
-    <dl class="facts">${rows.map(([k, v]) => `<div class="fact"><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
-    <div class="actions">
-      <a class="btn" href="${esc(o.link)}" target="_blank" rel="noopener noreferrer">Go to application ↗</a>
-      ${me.role === 'student' ? `<button class="btn alt ${saved ? 'on' : ''}" data-save="${o.id}">${saved ? '♥ Saved' : '♡ Save to wishlist'}</button>` : ''}
-      ${canEdit(o) ? `<a class="btn alt" href="#/form/${o.id}">Edit</a>` : ''}
+    ['Location', o.location], ['Status', o.status]];
+  view(`${head(esc(o.title), `Offered by ${esc(o.provider)}`, `<span class="stat"><b>${due}</b></span>`)}
+    <div class="wrap"><a class="back-link" href="#/discover">← Back to all opportunities</a>
+    <div class="detail-grid"><div>
+      <div class="panel"><h2>About this opportunity</h2><p class="pre">${esc(o.description)}</p></div>
+      <div class="panel"><h2>Who can apply</h2><p class="pre">${esc(o.eligibility)}</p></div></div>
+      <aside class="side"><dl class="facts">${rows.map(([k, v]) => `<div class="fact"><dt>${k}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
+        <div class="actions"><a class="btn" href="${esc(o.link)}" target="_blank" rel="noopener noreferrer">Go to application ↗</a>
+          ${me.role === 'student' ? `<button class="btn alt ${saved ? 'on' : ''}" data-save="${o.id}">${saved ? '♥ Saved' : '♡ Save to wishlist'}</button>` : ''}
+          ${canEdit(o) ? `<a class="btn alt" href="#/form/${o.id}">Edit</a>` : ''}</div></aside>
     </div></div>`);
   wireSave();
 }
@@ -199,13 +223,10 @@ async function renderDetail(id) {
 /* ---------- WISHLIST (students only; nobody else can see it) ---------- */
 async function renderWishlist() {
   const items = await api('/api/saved');
-  view(`<div class="wrap"><h1 class="page-title">My Wishlist</h1>
-    ${items.map(o => { const [cls, txt] = statusTag(o); return `<div class="card"><div class="card-main">
-      <h3><a href="#/detail/${o.id}">${esc(o.title)}</a></h3>
-      <div class="meta"><span>Deadline: ${esc(o.deadline)}</span><span class="status ${cls}">${txt}</span></div>
-      </div><div class="card-side"><button class="heart on" data-save="${o.id}">♥ Saved</button></div></div>`; }).join('')
-      || '<div class="empty">Your wishlist is empty. <a href="#/discover">Discover opportunities</a>.</div>'}
-  </div>`);
+  savedSet.clear(); items.forEach(o => savedSet.add(o.id));
+  view(`${head('My wishlist', 'Opportunities you saved. Only you can see this list.')}
+    <div class="wrap"><section class="grid">${items.map(o => oppCard(o, true)).join('')
+      || '<div class="empty">Your wishlist is empty.<br><a class="btn" href="#/discover">Discover opportunities</a></div>'}</section></div>`);
   wireSave();
 }
 
@@ -213,10 +234,10 @@ async function renderWishlist() {
 async function renderManage() {
   const rows = await api('/api/opportunities/manage');
   const reviewer = PUBLISH.includes(me.role);
-  view(`<div class="wrap wide"><div class="row-between">
-    <h1 class="page-title">${me.role === 'teacher' ? 'My submissions' : 'Review opportunities'}</h1>
-    <a class="btn" href="#/form">Add opportunity</a></div>
-    <div class="scroll"><table>
+  view(`${head(me.role === 'teacher' ? 'My submissions' : 'Review opportunities',
+      me.role === 'teacher' ? 'Opportunities you added. Heads of department approve them before students see them.' : 'Approve or reject what teachers submit. Approved opportunities appear for students.',
+      '<a class="btn" href="#/form">Add opportunity</a>')}
+    <div class="wrap"><div class="scroll"><table>
       <thead><tr><th>Name</th><th>Deadline</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>${rows.map(o => `<tr>
         <td><a href="#/detail/${o.id}">${esc(o.title)}</a><br><span class="muted-text">${esc(o.created_by_name)}</span></td>
@@ -250,10 +271,9 @@ async function renderForm(id) {
     <label for="f-${k}">${label}</label>${k === 'description'
       ? `<textarea id="f-${k}" rows="5" maxlength="2000">${esc(o[k])}</textarea>`
       : `<input id="f-${k}" type="${type}" value="${esc(o[k])}">`}</div>`;
-  view(`<div class="wrap"><a class="back-link" href="#/manage">← Back</a>
-    <h1 class="page-title">${id ? 'Edit opportunity' : 'Add opportunity'}</h1>
-    ${me.role === 'teacher' ? '<p class="muted-text">Your opportunity will be sent to the head of department for approval.</p>' : ''}
-    <div class="panel formgrid">
+  view(`${head(id ? 'Edit opportunity' : 'Add opportunity', me.role === 'teacher' ? 'Your opportunity is sent to the head of department for approval.' : '')}
+    <div class="wrap"><a class="back-link" href="#/manage">← Back</a>
+    <div class="panel formgrid" style="margin-top:0">
       ${inp('title', 'Name', 'text', true)}${inp('provider', 'Provider', 'text', true)}${inp('description', 'Description', 'text', true)}
       <div class="form-group"><label for="f-field">Field</label>${sel('field', meta.fields)}</div>
       <div class="form-group"><label for="f-type">Type</label>${sel('type', meta.types)}</div>
@@ -278,6 +298,7 @@ const mf = { q: '', role: '', status: '', editing: null, report: null };
 const MAX_APPROVERS = 3;
 
 function parseTable(text) {            // reads CSV or text pasted from Excel / Google Sheets
+  text = text.replace(/^\uFEFF/, '');
   const first = text.split(/\r?\n/)[0] || '';
   const d = first.includes('\t') ? '\t' : first.includes(';') && !first.includes(',') ? ';' : ',';
   const rows = []; let row = [], cur = '', q = false;
@@ -312,9 +333,9 @@ async function renderMembers() {
     <button class="btn sm" data-bulk data-label="${esc(label)}" data-scope="${scope}" data-value="${esc(value)}" data-on="1">Give access</button>
     <button class="btn alt sm" data-bulk data-label="${esc(label)}" data-scope="${scope}" data-value="${esc(value)}" data-on="">Remove access</button></div>`;
 
-  view(`<div class="wrap wide"><h1 class="page-title">Members</h1>
-    <p class="muted-text">${rows.length} people in the database · ${active} can log in · ${approvers} of ${MAX_APPROVERS} approvers.
-      Nobody can sign up by themselves: only people added here can log in.</p>
+  view(`${head('Members', 'Only people added here can log in. Nobody can sign up by themselves.',
+      `<span class="stat"><b>${rows.length}</b> people</span><span class="stat"><b>${active}</b> can log in</span><span class="stat"><b>${approvers}/${MAX_APPROVERS}</b> approvers</span>`)}
+    <div class="wrap"><div class="two">
 
     <div class="panel"><h2>${ed ? 'Edit ' + esc(ed.name) : 'Add one person'}</h2>
       <div class="formgrid">
@@ -340,6 +361,7 @@ async function renderMembers() {
         ${mf.report.skipped.length ? '<ul class="muted-text">' + mf.report.skipped.slice(0, 50).map(x => `<li>${esc(x)}</li>`).join('') + '</ul>' : ''}` : ''}
     </div>`}
 
+    </div>
     <div class="panel"><h2>Everyone in the organisation</h2>
       <div class="btn-row" style="margin-bottom:14px">
         <input id="s-q" type="search" placeholder="Search name, email or group" value="${esc(mf.q)}" style="flex:1;min-width:200px">
