@@ -569,10 +569,22 @@ def bootstrap_first_admin():
                           group_name='Approvers', password_hash=generate_password_hash(pw), on_platform=True))
     db.session.commit()
 
-
+def reset_admin_password_from_env():
+   """Temporary: sets the admin password from RESET_ADMIN_PASSWORD. Remove after use."""
+   email = os.environ.get('FIRST_ADMIN_EMAIL', '').strip().lower()
+   pw = os.environ.get('RESET_ADMIN_PASSWORD', '')
+   if not email or not pw:
+       return
+   m = Member.query.filter_by(email=email).first()
+   if m:
+       m.password_hash = generate_password_hash(pw)
+       db.session.commit()
+       print('Admin password reset from RESET_ADMIN_PASSWORD')
+           
 with app.app_context():
-    db.create_all()
-    bootstrap_first_admin()
+   db.create_all()
+   bootstrap_first_admin()
+   reset_admin_password_from_env()
 
 if __name__ == '__main__':
     app.run(debug=True)
