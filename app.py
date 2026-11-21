@@ -35,7 +35,7 @@ AIDS = ['Need blind', 'Need aware', 'Full aid', 'Partial aid', 'No aid']
 TEXT_FIELDS = ['title', 'provider', 'description', 'field', 'aid', 'type', 'deadline',
                'location', 'eligibility', 'link']
 NUM_FIELDS = ['age_min', 'age_max', 'duration_weeks']
-MAX_ADMINS = 3                           # only 3 approvers (admins) may exist
+MAX_ADMINS = 6                           # only 6 approvers (admins) may exist
 DEFAULT_GROUP = {'student': 'Students', 'teacher': 'Teachers', 'hod': 'Heads of Department',
                  'staff': 'Staff', 'admin': 'Approvers'}
 ROLE_ALIASES = {'approver': 'admin', 'head': 'hod', 'head of department': 'hod', 'department head': 'hod',
@@ -71,6 +71,12 @@ class Member(db.Model):
     @property
     def full_name(self):
         return f'{self.first_name} {self.last_name}'
+
+
+class PasswordChange(db.Model):
+    """When each person last chose a password. Used for the once-every-2-months rule."""
+    member_id = db.Column(db.Integer, db.ForeignKey('member.id'), primary_key=True)
+    changed_at = db.Column(db.DateTime, nullable=False)
 
 
 class Setting(db.Model):
@@ -228,8 +234,32 @@ def send_later(messages):
 
 # ---------- set-password links (no passwords are ever generated or emailed) ----------
 LINK_DAYS = 7              # links from an approver / welcome email
+PASSWORD_CHANGE_DAYS = 60  # people may change their own password once every 2 months
 RESET_MINUTES = 120        # links people request themselves ("forgot password")
 _last_request = {}         # email -> time of the last self-requested link (stops inbox spamming)
+_ip_checks = {}            # ip -> times of recent "is this email in the system?" checks
+
+
+def too_many_checks(ip, limit=30, window=600):
+    """Slows down anyone trying lots of emails to find out who is a member."""
+    t = time.time()
+    recent = [x for x in _ip_checks.get(ip, []) if t - x < window]
+    recent.append(t)
+    _ip_checks[ip] = recent
+    return len(recent) > limit
+
+
+def has_password(m):
+    return bool(m.password_hash) and not m.password_hash.startswith('!')
+
+
+def next_change_date(m):
+    """None if the person may change their password now, otherwise the date they may next do so."""
+    row = db.session.get(PasswordChange, m.id)
+    if not row:
+        return None
+    allowed = row.changed_at + dt.timedelta(days=PASSWORD_CHANGE_DAYS)
+    return allowed if allowed > now() else None
 
 
 def _pw_serializer():
@@ -268,6 +298,10 @@ def read_password_token(token):
 
 def password_email(m, kind='welcome'):
     link = password_link(m, kind)
+    if kind == 'approver':
+        return (m.email, 'Choose a new password for Opportunity Navigator',
+                f'Hi {m.first_name},\n\nAn approver has sent you a link to choose a new password:\n{link}\n\n'
+                f'The link works once and expires in {LINK_DAYS} days.')
     if kind == 'reset':
         return (m.email, 'Reset your Opportunity Navigator password',
                 f'Hi {m.first_name},\n\nChoose a new password here:\n{link}\n\n'
@@ -312,14 +346,46 @@ def can_edit(m, o):
 
 
 # ---------- LOGIN: password, then emailed code or link ----------
-@app.post('/api/password-link/request')
-def password_link_request():
-    """First time here / forgot password. Always answers the same, so it never reveals who has an account."""
+def client_ip():
+    return (request.headers.get('X-Forwarded-For', request.remote_addr or '').split(',')[0]).strip()
+
+
+@app.post('/api/login/start')
+def login_start():
+    """Step 1 of logging in: just the email. Tells the page whether to ask for a password
+    (returning person) or that a link to create one has been emailed (first time)."""
+    if too_many_checks(client_ip()):
+        return err('Too many attempts. Please wait a few minutes and try again.', 429)
     email = str((request.get_json(silent=True) or {}).get('email', '')).strip().lower()
     m = Member.query.filter_by(email=email).first() if EMAIL_RE.match(email) else None
-    if m and m.on_platform and time.time() - _last_request.get(email, 0) > 60:
+    if not m or not m.on_platform:
+        return err('This email has not been added to the platform. Please contact an approver.', 404)
+    if has_password(m):
+        return jsonify(step='password', name=m.first_name)
+    if time.time() - _last_request.get(email, 0) > 60:           # first time: email a link to create a password
         _last_request[email] = time.time()
-        send_later([password_email(m, 'reset')])
+        send_later([password_email(m, 'welcome')])
+    return jsonify(step='link_sent', name=m.first_name)
+
+
+@app.post('/api/password-link/request')
+def password_link_request():
+    """'Forgot password'. People can change their own password once every 2 months;
+    only an approver can send a link sooner."""
+    if too_many_checks(client_ip()):
+        return err('Too many attempts. Please wait a few minutes and try again.', 429)
+    email = str((request.get_json(silent=True) or {}).get('email', '')).strip().lower()
+    m = Member.query.filter_by(email=email).first() if EMAIL_RE.match(email) else None
+    if not m or not m.on_platform:
+        return jsonify(ok=True)                                  # say nothing about unknown emails
+    if has_password(m):
+        when = next_change_date(m)
+        if when:
+            return err(f'You can only change your password once every 2 months. You can change it again on {when:%d %B %Y}. '
+                       'If it is urgent, ask an approver to send you a link.', 429)
+    if time.time() - _last_request.get(email, 0) > 60:
+        _last_request[email] = time.time()
+        send_later([password_email(m, 'reset' if has_password(m) else 'welcome')])
     return jsonify(ok=True)
 
 
@@ -347,6 +413,11 @@ def password_link_set():
     if pw.lower() == m.email.lower():
         return err('Your password cannot be the same as your email.')
     m.password_hash = generate_password_hash(pw)
+    row = db.session.get(PasswordChange, m.id)
+    if row:
+        row.changed_at = now()
+    else:
+        db.session.add(PasswordChange(member_id=m.id, changed_at=now()))
     LoginCode.query.filter_by(member_id=m.id).delete()
     db.session.commit()
     return jsonify(ok=True)
@@ -699,6 +770,7 @@ def admin_delete(m, mid):
         return err('This person has added opportunities, so they cannot be deleted. Remove their access instead.')
     Saved.query.filter_by(member_id=x.id).delete()
     LoginCode.query.filter_by(member_id=x.id).delete()
+    PasswordChange.query.filter_by(member_id=x.id).delete()
     db.session.delete(x)
     db.session.commit()
     return jsonify(ok=True)
@@ -710,7 +782,7 @@ def admin_reset(m, mid):
     x = db.session.get(Member, mid)
     if not x or not x.on_platform:
         return err('Only members with access can be sent a password link.')
-    send_later([password_email(x)])
+    send_later([password_email(x, 'approver')])
     return jsonify(ok=True)
 
 
