@@ -43,6 +43,9 @@ ROLE_ALIASES = {'approver': 'admin', 'head': 'hod', 'head of department': 'hod',
 EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 OTP_MINUTES = 10
 OTP_MAX_TRIES = 5
+MAX_BAD_PASSWORDS = 8                    # wrong passwords allowed before a short lock
+LOCK_MINUTES = 15
+_bad_logins = {}                         # email -> [count, time of first failure]
 
 
 def now():
@@ -68,6 +71,30 @@ class Member(db.Model):
     @property
     def full_name(self):
         return f'{self.first_name} {self.last_name}'
+
+
+class Setting(db.Model):
+    """Small on/off switches approvers control, e.g. whether an email code is needed to log in."""
+    key = db.Column(db.String(60), primary_key=True)
+    value = db.Column(db.String(200), nullable=False, default='')
+
+
+def get_setting(key, default=''):
+    row = db.session.get(Setting, key)
+    return row.value if row else default
+
+
+def set_setting(key, value):
+    row = db.session.get(Setting, key)
+    if row:
+        row.value = str(value)
+    else:
+        db.session.add(Setting(key=key, value=str(value)))
+    db.session.commit()
+
+
+def code_required():
+    return get_setting('require_code', '0') == '1'      # OFF unless an approver turns it on
 
 
 class LoginCode(db.Model):
@@ -248,8 +275,7 @@ def password_email(m, kind='welcome'):
     return (m.email, 'You have been added to Opportunity Navigator',
             f'Hi {m.first_name},\n\nYou now have access to Opportunity Navigator.\n\n'
             f'Choose your password here:\n{link}\n\n'
-            f'The link works once and expires in {LINK_DAYS} days. After that, log in at {APP_URL} with your email and your new password; '
-            'we then email you a 6-digit code (or a link) to confirm it is you.')
+            f'The link works once and expires in {LINK_DAYS} days. After that, log in at {APP_URL} with your email and your new password.')
 
 
 def grant_access(m, queue):
@@ -329,11 +355,25 @@ def password_link_set():
 @app.post('/api/login')
 def login():
     d = request.get_json(silent=True) or {}
-    m = Member.query.filter_by(email=str(d.get('email', '')).strip().lower()).first()
-    if not m or not check_password_hash(m.password_hash, d.get('password', '')):
+    email = str(d.get('email', '')).strip().lower()
+    count, first = _bad_logins.get(email, [0, 0])
+    if count and time.time() - first > LOCK_MINUTES * 60:
+        count = 0
+        _bad_logins.pop(email, None)
+    if count >= MAX_BAD_PASSWORDS:
+        return err(f'Too many wrong passwords. Please wait {LOCK_MINUTES} minutes, or use "forgot your password".', 429)
+    m = Member.query.filter_by(email=email).first()
+    if not m or not check_password_hash(m.password_hash, str(d.get('password', ''))):
+        _bad_logins[email] = [count + 1, first or time.time()]
         return err('Email or password is incorrect.', 401)
     if not m.on_platform:
         return err('Your account is not active on the platform. Please contact the administrator.', 403)
+    _bad_logins.pop(email, None)
+    if not code_required():                                   # default: email + password is enough
+        session.clear()
+        session.permanent = True
+        session['member_id'] = m.id
+        return jsonify(ok=True, verify=False, user=member_json(m))
     code, token = f'{secrets.randbelow(10**6):06d}', secrets.token_urlsafe(24)
     LoginCode.query.filter_by(member_id=m.id).delete()
     db.session.add(LoginCode(member_id=m.id, code_hash=h(code), token_hash=h(token),
@@ -347,7 +387,7 @@ def login():
     except Exception as e:
         print('LOGIN EMAIL FAILED:', e)
         return err('We could not send your sign-in email. Please try again or contact an approver.', 500)
-    return jsonify(ok=True)
+    return jsonify(ok=True, verify=True)
 
 
 @app.post('/api/verify')
@@ -567,6 +607,20 @@ def add_members(rows, give_access):
     db.session.commit()
     send_later(queue)
     return added, skipped
+
+
+@app.get('/api/admin/settings')
+@login_required('admin')
+def admin_settings(m):
+    return jsonify(require_code=code_required())
+
+
+@app.post('/api/admin/settings')
+@login_required('admin')
+def admin_settings_save(m):
+    d = request.get_json(silent=True) or {}
+    set_setting('require_code', '1' if d.get('require_code') else '0')
+    return jsonify(require_code=code_required())
 
 
 @app.get('/api/admin/members')
