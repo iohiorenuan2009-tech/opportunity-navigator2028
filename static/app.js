@@ -77,14 +77,14 @@ function renderLogin() {
     <div class="form-group"><label for="l-email">Email</label><input id="l-email" type="email" autocomplete="email" value="${esc(prefillEmail)}"></div>
     <div class="form-group"><label for="l-pw">Password</label><input id="l-pw" type="password" autocomplete="current-password"></div>
     <button class="btn block" id="l-go">Continue</button>
-    <p class="muted-text">We will email you a code and a sign-in link to confirm it is you.</p>
     <p><a href="#/forgot">First time here, or forgot your password?</a></p>
   </div></div>`);
   const submit = async () => {
     try {
       pendingEmail = $('#l-email').value.trim();
-      await api('/api/login', 'POST', { email: pendingEmail, password: $('#l-pw').value });
-      location.hash = '#/verify';
+      const res = await api('/api/login', 'POST', { email: pendingEmail, password: $('#l-pw').value });
+      if (res.verify === false) { me = res.user; location.hash = '#/discover'; route(); }
+      else location.hash = '#/verify';
     } catch (e) { flash(e.message, true); }
   };
   $('#l-go').onclick = submit;
@@ -395,7 +395,7 @@ function parseTable(text) {            // reads CSV or text pasted from Excel / 
 }
 
 async function renderMembers() {
-  const [rows, groups] = await Promise.all([api('/api/admin/members'), api('/api/admin/groups')]);
+  const [rows, groups, cfg] = await Promise.all([api('/api/admin/members'), api('/api/admin/groups'), api('/api/admin/settings')]);
   const roles = [...new Set(rows.map(r => r.role))];
   const approvers = rows.filter(r => r.role === 'admin').length;
   const active = rows.filter(r => r.on_platform).length;
@@ -412,7 +412,11 @@ async function renderMembers() {
 
   view(`${head('Members', 'Only people added here can log in. Nobody can sign up by themselves.',
       `<span class="stat"><b>${rows.length}</b> people</span><span class="stat"><b>${active}</b> can log in</span><span class="stat"><b>${approvers}/${MAX_APPROVERS}</b> approvers</span>`)}
-    <div class="wrap"><div class="two">
+    <div class="wrap"><div class="panel" style="margin:0 0 24px"><div class="row-between" style="margin:0;align-items:center">
+      <div style="flex:1 1 420px"><h2 style="margin:0 0 6px">Email code at log-in</h2>
+        <p class="muted-text">Off: people log in with email and password only. On: everyone also has to enter a 6-digit code (or click a link) we email them each time they log in.</p></div>
+      <label class="chk"><input type="checkbox" id="s-code" ${cfg.require_code ? 'checked' : ''}> Require a code</label></div></div>
+    <div class="two">
 
     <div class="panel"><h2>${ed ? 'Edit ' + esc(ed.name) : 'Add one person'}</h2>
       <div class="formgrid">
@@ -465,6 +469,11 @@ async function renderMembers() {
     </details></div>`);
 
   const rerender = () => renderMembers();
+  $('#s-code').onchange = async e => {
+    try { await api('/api/admin/settings', 'POST', { require_code: e.target.checked });
+      flash(e.target.checked ? 'Everyone now needs an email code to log in.' : 'Email code switched off. Email and password is enough.');
+    } catch (err) { e.target.checked = !e.target.checked; flash(err.message, true); }
+  };
   $('#s-q').onchange = e => { mf.q = e.target.value; rerender(); };
   $('#s-role').onchange = e => { mf.role = e.target.value; rerender(); };
   $('#s-status').onchange = e => { mf.status = e.target.value; rerender(); };
@@ -491,10 +500,22 @@ async function renderMembers() {
       const people = parseTable($('#i-text').value);
       if (!people.length) return flash('Nothing found. Make sure the first row has headings and there is at least one person.', true);
       if (!confirm(`Import ${people.length} people${$('#i-access').checked ? ' and email each of them a link to choose a password' : ''}?`)) return;
+      const btn = $('#i-go'), access = $('#i-access').checked, BATCH = 200;   // big lists are sent 200 at a time
+      const report = { added: 0, skipped: [] };
+      btn.disabled = true;
       try {
-        mf.report = await api('/api/admin/members/import', 'POST', { rows: people, give_access: $('#i-access').checked });
-        flash(`${mf.report.added} added.`); rerender();
-      } catch (e) { flash(e.message, true); }
+        for (let i = 0; i < people.length; i += BATCH) {
+          btn.textContent = `Importing ${Math.min(i + BATCH, people.length)} of ${people.length}...`;
+          const r = await api('/api/admin/members/import', 'POST', { rows: people.slice(i, i + BATCH), give_access: access });
+          report.added += r.added; report.skipped.push(...r.skipped);
+        }
+        mf.report = report;
+        flash(`${report.added} added.`); rerender();
+      } catch (e) {
+        mf.report = report;
+        flash(`Stopped after ${report.added} were added: ${e.message} You can import the same file again; people already added are skipped.`, true);
+        rerender();
+      }
     };
   }
 
