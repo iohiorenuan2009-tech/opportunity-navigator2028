@@ -1,11 +1,12 @@
 """Opportunity Navigator backend (Flask + SQLAlchemy).
 Local: SQLite file. Online: set DATABASE_URL to a hosted Postgres URL."""
-import os, re, json, urllib.request, urllib.error, secrets, hashlib, smtplib, threading, datetime as dt
+import os, re, json, time, urllib.request, urllib.error, secrets, hashlib, smtplib, threading, datetime as dt
 from email.message import EmailMessage
 from functools import wraps
 
 from flask import Flask, request, session, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -144,7 +145,23 @@ def login_required(*roles):
 
 
 def send_email(to, subject, body):
-    """Sends through Brevo's web API (works on Render's free plan). Falls back to SMTP, then to printing."""
+    """Sends through SMTP2GO or Brevo web APIs (both work on Render's free plan). Falls back to SMTP, then to printing."""
+    key2go = os.environ.get('SMTP2GO_API_KEY')
+    if key2go:
+        sender = os.environ.get('EMAIL_FROM') or os.environ.get('SMTP_FROM', '')
+        name = os.environ.get('EMAIL_FROM_NAME', 'Opportunity Navigator')
+        payload = json.dumps({'api_key': key2go, 'to': [to], 'sender': f'{name} <{sender}>',
+                              'subject': subject, 'text_body': body}).encode()
+        req = urllib.request.Request('https://api.smtp2go.com/v3/email/send', data=payload, method='POST',
+                                     headers={'X-Smtp2go-Api-Key': key2go, 'Content-Type': 'application/json',
+                                              'Accept': 'application/json'})
+        try:
+            reply = json.loads(urllib.request.urlopen(req, timeout=20).read() or b'{}')
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f'SMTP2GO said {e.code}: {e.read().decode()[:300]}')
+        if (reply.get('data') or {}).get('succeeded', 1) < 1:
+            raise RuntimeError(f'SMTP2GO refused the email: {str(reply)[:300]}')
+        return
     key = os.environ.get('BREVO_API_KEY')
     if key:
         sender = os.environ.get('EMAIL_FROM') or os.environ.get('SMTP_FROM', '')
@@ -182,19 +199,63 @@ def send_later(messages):
         threading.Thread(target=run, daemon=True).start()
 
 
-def new_password():
-    return ''.join(secrets.choice('abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(10))
+# ---------- set-password links (no passwords are ever generated or emailed) ----------
+LINK_DAYS = 7              # links from an approver / welcome email
+RESET_MINUTES = 120        # links people request themselves ("forgot password")
+_last_request = {}         # email -> time of the last self-requested link (stops inbox spamming)
+
+
+def _pw_serializer():
+    return URLSafeTimedSerializer(app.config['SECRET_KEY'], salt='set-password')
+
+
+def _fingerprint(m):
+    return hashlib.sha256((m.password_hash or '').encode()).hexdigest()[:16]
+
+
+def password_link(m, kind='welcome'):
+    """A signed, single-use link. It stops working as soon as the password changes."""
+    if m.id is None:
+        db.session.flush()
+    token = _pw_serializer().dumps({'id': m.id, 'f': _fingerprint(m), 'k': kind})
+    return f'{APP_URL}/#/set-password?token={token}'
+
+
+def read_password_token(token):
+    """Returns the member for a valid link, or raises ValueError with a message to show."""
+    try:
+        data, stamp = _pw_serializer().loads(str(token or ''), max_age=LINK_DAYS * 86400, return_timestamp=True)
+    except SignatureExpired:
+        raise ValueError('This link has expired. Ask for a new one.')
+    except BadSignature:
+        raise ValueError('This link is not valid.')
+    if data.get('k') == 'reset' and time.time() - stamp.timestamp() > RESET_MINUTES * 60:
+        raise ValueError('This link has expired. Ask for a new one.')
+    m = db.session.get(Member, data.get('id'))
+    if not m or data.get('f') != _fingerprint(m):
+        raise ValueError('This link has already been used or replaced. Ask for a new one.')
+    if not m.on_platform:
+        raise ValueError('Your account is not active on the platform. Please contact an approver.')
+    return m
+
+
+def password_email(m, kind='welcome'):
+    link = password_link(m, kind)
+    if kind == 'reset':
+        return (m.email, 'Reset your Opportunity Navigator password',
+                f'Hi {m.first_name},\n\nChoose a new password here:\n{link}\n\n'
+                f'The link works once and expires in {RESET_MINUTES // 60} hours. If you did not ask for this, ignore this email.')
+    return (m.email, 'You have been added to Opportunity Navigator',
+            f'Hi {m.first_name},\n\nYou now have access to Opportunity Navigator.\n\n'
+            f'Choose your password here:\n{link}\n\n'
+            f'The link works once and expires in {LINK_DAYS} days. After that, log in at {APP_URL} with your email and your new password; '
+            'we then email you a 6-digit code (or a link) to confirm it is you.')
 
 
 def grant_access(m, queue):
-    """Switch a member on, give them a fresh random password and queue the welcome email."""
-    pw = new_password()
-    m.password_hash = generate_password_hash(pw)
+    """Switch a member on and queue an email with a link to choose their password."""
     m.on_platform = True
-    queue.append((m.email, 'You have been added to Opportunity Navigator',
-                  f'Hi {m.first_name},\n\nYou now have access to Opportunity Navigator.\n\n'
-                  f'Open: {APP_URL}\nEmail: {m.email}\nPassword: {pw}\n\n'
-                  'After you enter these, we email you a 6-digit code (or a link) to confirm it is you.'))
+    queue.append(password_email(m))
 
 
 def clean_opp(d):
@@ -225,6 +286,46 @@ def can_edit(m, o):
 
 
 # ---------- LOGIN: password, then emailed code or link ----------
+@app.post('/api/password-link/request')
+def password_link_request():
+    """First time here / forgot password. Always answers the same, so it never reveals who has an account."""
+    email = str((request.get_json(silent=True) or {}).get('email', '')).strip().lower()
+    m = Member.query.filter_by(email=email).first() if EMAIL_RE.match(email) else None
+    if m and m.on_platform and time.time() - _last_request.get(email, 0) > 60:
+        _last_request[email] = time.time()
+        send_later([password_email(m, 'reset')])
+    return jsonify(ok=True)
+
+
+@app.post('/api/password-link/check')
+def password_link_check():
+    try:
+        m = read_password_token((request.get_json(silent=True) or {}).get('token'))
+    except ValueError as e:
+        return err(str(e), 400)
+    return jsonify(name=m.first_name, email=m.email)
+
+
+@app.post('/api/password-link/set')
+def password_link_set():
+    d = request.get_json(silent=True) or {}
+    try:
+        m = read_password_token(d.get('token'))
+    except ValueError as e:
+        return err(str(e), 400)
+    pw = str(d.get('password') or '')
+    if len(pw) < 8:
+        return err('Your password must be at least 8 characters.')
+    if len(pw) > 128:
+        return err('Your password is too long (128 characters at most).')
+    if pw.lower() == m.email.lower():
+        return err('Your password cannot be the same as your email.')
+    m.password_hash = generate_password_hash(pw)
+    LoginCode.query.filter_by(member_id=m.id).delete()
+    db.session.commit()
+    return jsonify(ok=True)
+
+
 @app.post('/api/login')
 def login():
     d = request.get_json(silent=True) or {}
@@ -333,6 +434,32 @@ def create_opp(m):
     return jsonify(o.to_dict()), 201
 
 
+@app.post('/api/opportunities/import')
+@login_required(*REVIEWERS)
+def import_opps(m):
+    """Bulk-add opportunities from a CSV (approvers and heads of department). They go live at once."""
+    rows = (request.get_json(silent=True) or {}).get('rows') or []
+    if not isinstance(rows, list) or not rows:
+        return err('No opportunities found to import.')
+    if len(rows) > 500:
+        return err('Please import at most 500 opportunities at a time.')
+    existing = {(t.lower(), p.lower()) for t, p in db.session.query(Opportunity.title, Opportunity.provider).all()}
+    added, skipped = 0, []
+    for i, r in enumerate(rows, 1):
+        v, errs = clean_opp(r)
+        label = str(r.get('title') or f'row {i}')[:60]
+        if errs:
+            skipped.append(f'{label}: {errs[0]}'); continue
+        key = (v['title'].lower(), v['provider'].lower())
+        if key in existing:
+            skipped.append(f'{label}: already exists'); continue
+        existing.add(key)
+        db.session.add(Opportunity(**v, created_by=m.id, status='published'))
+        added += 1
+    db.session.commit()
+    return jsonify(added=added, skipped=skipped)
+
+
 @app.put('/api/opportunities/<int:oid>')
 @login_required(*ADDERS)
 def update_opp(m, oid):
@@ -407,6 +534,7 @@ def add_members(rows, give_access):
     """Create members from a list of dicts. Returns (added, skipped). Nobody can self-register."""
     added, skipped, queue, seen = 0, [], [], set()
     admins = admin_count()
+    existing = {e for (e,) in db.session.query(Member.email).all()}
     for i, r in enumerate(rows, 1):
         first, last = str(r.get('first_name') or '').strip(), str(r.get('last_name') or '').strip()
         if not first and r.get('name'):
@@ -422,7 +550,7 @@ def add_members(rows, give_access):
             skipped.append(f'{label}: not a valid email'); continue
         if role not in ROLES:
             skipped.append(f'{label}: unknown role "{role}"'); continue
-        if email in seen or Member.query.filter_by(email=email).first():
+        if email in seen or email in existing:
             skipped.append(f'{label}: already exists'); continue
         if role == 'admin' and admins >= MAX_ADMINS:
             skipped.append(f'{label}: there can only be {MAX_ADMINS} approvers'); continue
@@ -431,7 +559,7 @@ def add_members(rows, give_access):
             admins += 1
         m = Member(first_name=first[:60], last_name=last[:60], email=email, role=role,
                    group_name=(str(r.get('group') or '').strip() or DEFAULT_GROUP[role])[:60],
-                   password_hash=generate_password_hash(new_password()), on_platform=False)
+                   password_hash='!no-access-yet', on_platform=False)
         db.session.add(m)
         if give_access:
             grant_access(m, queue)
@@ -527,11 +655,8 @@ def admin_delete(m, mid):
 def admin_reset(m, mid):
     x = db.session.get(Member, mid)
     if not x or not x.on_platform:
-        return err('Only members with access can have their password reset.')
-    queue = []
-    grant_access(x, queue)
-    db.session.commit()
-    send_later(queue)
+        return err('Only members with access can be sent a password link.')
+    send_later([password_email(x)])
     return jsonify(ok=True)
 
 
