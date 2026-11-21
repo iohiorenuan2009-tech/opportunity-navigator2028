@@ -4,7 +4,7 @@ const ADD = ['teacher', 'hod', 'admin'], PUBLISH = ['hod', 'admin'];
 const ROLE_LABEL = { student: 'Student', teacher: 'Teacher', staff: 'Staff', hod: 'Head of department', admin: 'Approver' };
 const PLURAL = { student: 'students', teacher: 'teachers', staff: 'staff', hod: 'heads of department', admin: 'admins' };
 const filters = { q: '', field: '', type: '', aid: '', hideClosed: true };
-let me = null, meta = null, pendingEmail = '', prefillEmail = '';
+let me = null, meta = null, pendingEmail = '', prefillEmail = '', loginName = '';
 
 async function api(path, method = 'GET', body) {
   const res = await fetch(path, { method, credentials: 'same-origin',
@@ -71,31 +71,62 @@ window.addEventListener('hashchange', route);
 
 /* ---------- LOGIN: password, then code or link from email ---------- */
 function renderLogin() {
+  if (loginName && prefillEmail) return renderPasswordStep(loginName);
   view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
-    <h1>Welcome back</h1>
-    <p class="sub">Accounts are set up by the school. Log in with your school email.</p>
+    <h1>Welcome</h1>
+    <p class="sub">Accounts are set up by the school. Enter your school email to continue.</p>
     <div class="form-group"><label for="l-email">Email</label><input id="l-email" type="email" autocomplete="email" value="${esc(prefillEmail)}"></div>
-    <div class="form-group"><label for="l-pw">Password</label><input id="l-pw" type="password" autocomplete="current-password"></div>
     <button class="btn block" id="l-go">Continue</button>
-    <p><a href="#/forgot">First time here, or forgot your password?</a></p>
+    <p>First time here? Just enter your email. We will email you a link to create your password.</p>
   </div></div>`);
   const submit = async () => {
+    const email = $('#l-email').value.trim();
+    if (!email) return flash('Please enter your email.', true);
     try {
-      pendingEmail = $('#l-email').value.trim();
+      const res = await api('/api/login/start', 'POST', { email });
+      pendingEmail = prefillEmail = email;
+      if (res.step === 'password') { loginName = res.name; renderPasswordStep(res.name); }
+      else {
+        view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
+        <h1>Check your email</h1>
+        <p class="sub">Hi ${esc(res.name)}, this is your first time here. We have emailed <b>${esc(email)}</b> a link to create your password. After you create it, you will be asked to log in. Check your spam folder too.</p>
+        <a class="btn block" href="#/login" id="back-login">Back</a></div></div>`);
+      $('#back-login').onclick = ev => { ev.preventDefault(); prefillEmail = ''; renderLogin(); };
+      }
+    } catch (e) { flash(e.message, true); }
+  };
+  $('#l-go').onclick = submit;
+  $('#l-email').onkeydown = e => { if (e.key === 'Enter') submit(); };
+}
+
+function renderPasswordStep(name) {
+  view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
+    <h1>Welcome back, ${esc(name)}</h1>
+    <p class="sub">Logging in as <b>${esc(prefillEmail)}</b>. <a href="#/login" id="not-you">Not you?</a></p>
+    <div class="form-group"><label for="l-pw">Password</label><input id="l-pw" type="password" autocomplete="current-password"></div>
+    <button class="btn block" id="l-go">Log in</button>
+    <p><a href="#/forgot">Forgot your password?</a></p>
+  </div></div>`);
+  $('#not-you').onclick = e => { e.preventDefault(); loginName = ''; prefillEmail = ''; renderLogin(); };
+  const submit = async () => {
+    try {
+      pendingEmail = prefillEmail;
       const res = await api('/api/login', 'POST', { email: pendingEmail, password: $('#l-pw').value });
+      loginName = '';
       if (res.verify === false) { me = res.user; location.hash = '#/discover'; route(); }
       else location.hash = '#/verify';
     } catch (e) { flash(e.message, true); }
   };
   $('#l-go').onclick = submit;
   $('#l-pw').onkeydown = e => { if (e.key === 'Enter') submit(); };
+  $('#l-pw').focus();
 }
 
 /* ---------- FIRST TIME / FORGOT PASSWORD: a link by email ---------- */
 function renderForgot() {
   view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
-    <h1>Choose your password</h1>
-    <p class="sub">Enter your school email. If it has been added by an approver, we will email you a link to choose a password.</p>
+    <h1>Forgot your password?</h1>
+    <p class="sub"><b>You can only change your password once every 2 months.</b> Enter your school email and, if you are allowed to change it now, we will email you a link. If it is urgent, ask an approver to send you one.</p>
     <div class="form-group"><label for="f-email">Email</label><input id="f-email" type="email" autocomplete="email" value="${esc(prefillEmail)}"></div>
     <button class="btn block" id="f-go">Email me a link</button>
     <p><a href="#/login">Back to log in</a></p>
@@ -108,7 +139,7 @@ function renderForgot() {
       prefillEmail = email;
       view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
         <h1>Check your email</h1>
-        <p class="sub">If <b>${esc(email)}</b> has access, a link to choose your password is on its way. It can take a minute or two, so check your spam folder as well.</p>
+        <p class="sub">If <b>${esc(email)}</b> is allowed to change its password now, a link is on its way. It can take a minute or two, so check your spam folder as well.</p>
         <a class="btn block" href="#/login">Back to log in</a></div></div>`);
     } catch (e) { flash(e.message, true); }
   };
@@ -137,7 +168,7 @@ async function renderSetPassword(params) {
     if (a !== b) return flash('The two passwords do not match.', true);
     try {
       await api('/api/password-link/set', 'POST', { token, password: a });
-      prefillEmail = info.email;
+      prefillEmail = info.email; loginName = info.name;
       flash('Password saved. Please log in.');
       location.hash = '#/login';
     } catch (e) { flash(e.message, true); }
@@ -176,7 +207,7 @@ async function renderVerify(params) {
 
 async function logout() {
   await api('/api/logout', 'POST').catch(() => {});
-  me = null; flash('You have been logged out.');
+  me = null; prefillEmail = ''; loginName = ''; flash('You have been logged out.');
   location.hash = '#/login'; route();
 }
 
@@ -372,7 +403,7 @@ async function renderForm(id) {
 
 /* ---------- APPROVERS: see, add, import, edit and remove members ---------- */
 const mf = { q: '', role: '', status: '', editing: null, report: null };
-const MAX_APPROVERS = 3;
+const MAX_APPROVERS = 6;
 
 function parseTable(text) {            // reads CSV or text pasted from Excel / Google Sheets
   text = text.replace(/^\uFEFF/, '');
@@ -520,7 +551,7 @@ async function renderMembers() {
   }
 
   document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { mf.editing = +b.dataset.edit; rerender(); window.scrollTo(0, 0); });
-  document.querySelectorAll('[data-reset]').forEach(b => b.onclick = () => { if (confirm('Email this person a link to choose a new password?'))
+  document.querySelectorAll('[data-reset]').forEach(b => b.onclick = () => { if (confirm('Email this person a link to choose a new password? Use this when it is urgent: people can normally change their own password only once every 2 months.'))
     act(() => api(`/api/admin/members/${b.dataset.reset}/reset-password`, 'POST'), 'Password link sent.'); });
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { if (confirm(`Permanently delete ${b.dataset.name}?`))
     act(() => api('/api/admin/members/' + b.dataset.del, 'DELETE'), 'Deleted.'); });
