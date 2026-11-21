@@ -4,7 +4,7 @@ const ADD = ['teacher', 'hod', 'admin'], PUBLISH = ['hod', 'admin'];
 const ROLE_LABEL = { student: 'Student', teacher: 'Teacher', staff: 'Staff', hod: 'Head of department', admin: 'Approver' };
 const PLURAL = { student: 'students', teacher: 'teachers', staff: 'staff', hod: 'heads of department', admin: 'admins' };
 const filters = { q: '', field: '', type: '', aid: '', hideClosed: true };
-let me = null, meta = null, pendingEmail = '';
+let me = null, meta = null, pendingEmail = '', prefillEmail = '';
 
 async function api(path, method = 'GET', body) {
   const res = await fetch(path, { method, credentials: 'same-origin',
@@ -48,6 +48,8 @@ async function route() {
   const [page, id] = path.split('/');
   if (!meta) meta = await api('/api/meta');
   if (page === 'verify') return renderVerify(new URLSearchParams(query));
+  if (page === 'forgot') return renderForgot();
+  if (page === 'set-password') return renderSetPassword(new URLSearchParams(query));
   if (!me) { try { me = (await api('/api/me')).user; } catch { me = null; } }
   renderNav();
   if (!me) return renderLogin();
@@ -72,10 +74,11 @@ function renderLogin() {
   view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
     <h1>Welcome back</h1>
     <p class="sub">Accounts are set up by the school. Log in with your school email.</p>
-    <div class="form-group"><label for="l-email">Email</label><input id="l-email" type="email" autocomplete="email"></div>
+    <div class="form-group"><label for="l-email">Email</label><input id="l-email" type="email" autocomplete="email" value="${esc(prefillEmail)}"></div>
     <div class="form-group"><label for="l-pw">Password</label><input id="l-pw" type="password" autocomplete="current-password"></div>
     <button class="btn block" id="l-go">Continue</button>
     <p class="muted-text">We will email you a code and a sign-in link to confirm it is you.</p>
+    <p><a href="#/forgot">First time here, or forgot your password?</a></p>
   </div></div>`);
   const submit = async () => {
     try {
@@ -86,6 +89,61 @@ function renderLogin() {
   };
   $('#l-go').onclick = submit;
   $('#l-pw').onkeydown = e => { if (e.key === 'Enter') submit(); };
+}
+
+/* ---------- FIRST TIME / FORGOT PASSWORD: a link by email ---------- */
+function renderForgot() {
+  view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
+    <h1>Choose your password</h1>
+    <p class="sub">Enter your school email. If it has been added by an approver, we will email you a link to choose a password.</p>
+    <div class="form-group"><label for="f-email">Email</label><input id="f-email" type="email" autocomplete="email" value="${esc(prefillEmail)}"></div>
+    <button class="btn block" id="f-go">Email me a link</button>
+    <p><a href="#/login">Back to log in</a></p>
+  </div></div>`);
+  const submit = async () => {
+    const email = $('#f-email').value.trim();
+    if (!email) return flash('Please enter your email.', true);
+    try {
+      await api('/api/password-link/request', 'POST', { email });
+      prefillEmail = email;
+      view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
+        <h1>Check your email</h1>
+        <p class="sub">If <b>${esc(email)}</b> has access, a link to choose your password is on its way. It can take a minute or two, so check your spam folder as well.</p>
+        <a class="btn block" href="#/login">Back to log in</a></div></div>`);
+    } catch (e) { flash(e.message, true); }
+  };
+  $('#f-go').onclick = submit;
+  $('#f-email').onkeydown = e => { if (e.key === 'Enter') submit(); };
+}
+
+async function renderSetPassword(params) {
+  const token = params.get('token') || '';
+  let info;
+  try { info = await api('/api/password-link/check', 'POST', { token }); }
+  catch (e) {
+    return view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span><h1>Link not valid</h1>
+      <p class="sub">${esc(e.message)}</p><a class="btn block" href="#/forgot">Email me a new link</a></div></div>`);
+  }
+  view(`<div class="auth-page"><div class="auth-card"><span class="brand-mark">ON</span>
+    <h1>Hi ${esc(info.name)}, choose a password</h1>
+    <p class="sub">You will use it with <b>${esc(info.email)}</b> to log in. At least 8 characters.</p>
+    <div class="form-group"><label for="p-1">New password</label><input id="p-1" type="password" autocomplete="new-password"></div>
+    <div class="form-group"><label for="p-2">Type it again</label><input id="p-2" type="password" autocomplete="new-password"></div>
+    <button class="btn block" id="p-go">Save password</button>
+  </div></div>`);
+  const submit = async () => {
+    const a = $('#p-1').value, b = $('#p-2').value;
+    if (a.length < 8) return flash('Your password must be at least 8 characters.', true);
+    if (a !== b) return flash('The two passwords do not match.', true);
+    try {
+      await api('/api/password-link/set', 'POST', { token, password: a });
+      prefillEmail = info.email;
+      flash('Password saved. Please log in.');
+      location.hash = '#/login';
+    } catch (e) { flash(e.message, true); }
+  };
+  $('#p-go').onclick = submit;
+  $('#p-2').onkeydown = e => { if (e.key === 'Enter') submit(); };
 }
 
 async function renderVerify(params) {
@@ -237,7 +295,12 @@ async function renderManage() {
   view(`${head(me.role === 'teacher' ? 'My submissions' : 'Review opportunities',
       me.role === 'teacher' ? 'Opportunities you added. Heads of department approve them before students see them.' : 'Approve or reject what teachers submit. Approved opportunities appear for students.',
       '<a class="btn" href="#/form">Add opportunity</a>')}
-    <div class="wrap"><div class="scroll"><table>
+    <div class="wrap">${reviewer ? `<details class="panel" style="margin:0 0 24px"><summary>Import many opportunities from a CSV</summary>
+      <p class="muted-text" style="margin:12px 0">Upload a CSV or paste rows from a spreadsheet. First row = headings: title, provider, field, type, aid, deadline (YYYY-MM-DD), age_min, age_max, duration_weeks, location, eligibility, link, description. Imported opportunities are published straight away.</p>
+      <div class="form-group"><input type="file" id="o-file" accept=".csv,.tsv,.txt"></div>
+      <div class="form-group"><textarea id="o-text" rows="3" placeholder="Paste rows here"></textarea></div>
+      <button class="btn" id="o-go">Import opportunities</button><div id="o-report"></div></details>` : ''}
+    <div class="scroll"><table>
       <thead><tr><th>Name</th><th>Deadline</th><th>Status</th><th>Actions</th></tr></thead>
       <tbody>${rows.map(o => `<tr>
         <td><a href="#/detail/${o.id}">${esc(o.title)}</a><br><span class="muted-text">${esc(o.created_by_name)}</span></td>
@@ -250,6 +313,20 @@ async function renderManage() {
           ${canEdit(o) ? `<button class="btn danger sm" data-del="${o.id}">Delete</button>` : ''}
         </div></td></tr>`).join('') || '<tr><td colspan="4">Nothing here yet.</td></tr>'}</tbody>
     </table></div></div>`);
+  if (reviewer) {
+    $('#o-file').onchange = async e => { const f = e.target.files[0]; if (f) $('#o-text').value = await f.text(); };
+    $('#o-go').onclick = async () => {
+      const rows = parseTable($('#o-text').value);
+      if (!rows.length) return flash('Nothing found. The first row must be headings, followed by at least one opportunity.', true);
+      if (!confirm(`Import ${rows.length} opportunities and publish them now?`)) return;
+      try {
+        const r = await api('/api/opportunities/import', 'POST', { rows });
+        flash(`${r.added} imported.`);
+        if (r.skipped.length) { await route(); $('#o-report').innerHTML = `<p class="muted-text" style="margin-top:14px"><b>${r.skipped.length} skipped:</b></p><ul>${r.skipped.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`; $('#o-report').closest('details').open = true; }
+        else route();
+      } catch (e) { flash(e.message, true); }
+    };
+  }
   document.querySelectorAll('[data-review]').forEach(b => b.onclick = () =>
     act(() => api(`/api/opportunities/${b.dataset.review}/review`, 'POST', { action: b.dataset.action }),
       b.dataset.action === 'approve' ? 'Published.' : 'Rejected.'));
@@ -344,7 +421,7 @@ async function renderMembers() {
         <div class="form-group"><label for="m-email">Organisation email</label><input id="m-email" type="email" value="${esc(ed ? ed.email : '')}"></div>
         <div class="form-group"><label for="m-role">Role</label><select id="m-role">${roleOpts(ed ? ed.role : 'student')}</select></div>
         <div class="form-group"><label for="m-group">Group (e.g. Year 1) – optional</label><input id="m-group" value="${esc(ed ? ed.group : '')}"></div>
-        ${ed ? '' : '<label class="chk full"><input type="checkbox" id="m-access" checked> Let them log in now (we email them a password)</label>'}
+        ${ed ? '' : '<label class="chk full"><input type="checkbox" id="m-access" checked> Let them log in now (we email them a link to choose a password)</label>'}
         <div class="full btn-row"><button class="btn" id="m-save">${ed ? 'Save changes' : 'Add person'}</button>
           ${ed ? '<button class="btn alt" id="m-cancel">Cancel</button>' : ''}</div>
       </div></div>
@@ -355,7 +432,7 @@ async function renderMembers() {
         <a href="#" id="tpl">Download a template</a></p>
       <div class="form-group"><input type="file" id="i-file" accept=".csv,.tsv,.txt"></div>
       <div class="form-group"><textarea id="i-text" rows="4" placeholder="first_name,last_name,email,role,group&#10;Amara,Okafor,amara@school.org,student,Year 1"></textarea></div>
-      <label class="chk"><input type="checkbox" id="i-access" checked> Let them log in now (we email each person a password)</label>
+      <label class="chk"><input type="checkbox" id="i-access" checked> Let them log in now (we email each person a link to choose a password)</label>
       <div class="btn-row"><button class="btn" id="i-go">Import</button></div>
       ${mf.report ? `<p class="muted-text"><b>${mf.report.added} added.</b> ${mf.report.skipped.length ? mf.report.skipped.length + ' skipped:' : ''}</p>
         ${mf.report.skipped.length ? '<ul class="muted-text">' + mf.report.skipped.slice(0, 50).map(x => `<li>${esc(x)}</li>`).join('') + '</ul>' : ''}` : ''}
@@ -375,7 +452,7 @@ async function renderMembers() {
           <td><span class="badge ${r.on_platform ? 'b-published' : 'b-rejected'}">${r.on_platform ? 'Can log in' : 'No access'}</span></td>
           <td><div class="btn-row">
             <button class="btn sm ${r.on_platform ? 'alt' : ''}" data-scope="member" data-value="${r.id}" data-on="${r.on_platform ? '' : '1'}">${r.on_platform ? 'Remove access' : 'Give access'}</button>
-            ${r.on_platform ? `<button class="btn alt sm" data-reset="${r.id}">New password</button>` : ''}
+            ${r.on_platform ? `<button class="btn alt sm" data-reset="${r.id}">Send password link</button>` : ''}
             <button class="btn alt sm" data-edit="${r.id}">Edit</button>
             ${r.id === me.id ? '' : `<button class="btn danger sm" data-del="${r.id}" data-name="${esc(r.name)}">Delete</button>`}
           </div></td></tr>`).join('') || '<tr><td colspan="6">Nobody here yet. Add someone above.</td></tr>'}</tbody>
@@ -398,7 +475,7 @@ async function renderMembers() {
     try {
       if (ed) { await api('/api/admin/members/' + ed.id, 'PUT', body); mf.editing = null; flash('Saved.'); }
       else { await api('/api/admin/members', 'POST', { ...body, give_access: $('#m-access').checked });
-        flash($('#m-access').checked ? 'Added. A password email is on its way.' : 'Added.'); }
+        flash($('#m-access').checked ? 'Added. They will get an email with a link to choose their password.' : 'Added.'); }
       rerender();
     } catch (e) { flash(e.message, true); }
   };
@@ -413,7 +490,7 @@ async function renderMembers() {
     $('#i-go').onclick = async () => {
       const people = parseTable($('#i-text').value);
       if (!people.length) return flash('Nothing found. Make sure the first row has headings and there is at least one person.', true);
-      if (!confirm(`Import ${people.length} people${$('#i-access').checked ? ' and email each of them a password' : ''}?`)) return;
+      if (!confirm(`Import ${people.length} people${$('#i-access').checked ? ' and email each of them a link to choose a password' : ''}?`)) return;
       try {
         mf.report = await api('/api/admin/members/import', 'POST', { rows: people, give_access: $('#i-access').checked });
         flash(`${mf.report.added} added.`); rerender();
@@ -422,8 +499,8 @@ async function renderMembers() {
   }
 
   document.querySelectorAll('[data-edit]').forEach(b => b.onclick = () => { mf.editing = +b.dataset.edit; rerender(); window.scrollTo(0, 0); });
-  document.querySelectorAll('[data-reset]').forEach(b => b.onclick = () => { if (confirm('Email this person a new password?'))
-    act(() => api(`/api/admin/members/${b.dataset.reset}/reset-password`, 'POST'), 'New password emailed.'); });
+  document.querySelectorAll('[data-reset]').forEach(b => b.onclick = () => { if (confirm('Email this person a link to choose a new password?'))
+    act(() => api(`/api/admin/members/${b.dataset.reset}/reset-password`, 'POST'), 'Password link sent.'); });
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = () => { if (confirm(`Permanently delete ${b.dataset.name}?`))
     act(() => api('/api/admin/members/' + b.dataset.del, 'DELETE'), 'Deleted.'); });
   document.querySelectorAll('[data-scope]:not([data-bulk])').forEach(b => b.onclick = () =>
